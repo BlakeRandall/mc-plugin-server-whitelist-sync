@@ -1,0 +1,15 @@
+name: WhitelistSync
+version: 1.0.0
+main: dev.example.whitelistsync.WhitelistSyncPlugin
+api-version: '26.1'
+description: Synchronizes Paper whitelists through a shared MongoDB database.
+author: WhitelistSync
+commands:
+  whitelistsync:
+    description: Manage WhitelistSync
+    usage: /whitelistsync <sync|status|reload>
+    permission: whitelistsync.admin
+permissions:
+  whitelistsync.admin:
+    description: Allows administration of WhitelistSync.
+    default: op
