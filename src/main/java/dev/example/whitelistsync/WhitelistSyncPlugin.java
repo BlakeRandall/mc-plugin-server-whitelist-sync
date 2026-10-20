@@ -1,19 +1,26 @@
 package dev.example.whitelistsync;
 
-import com.mongodb.ConnectionString;
-import com.mongodb.MongoClientSettings;
-import com.mongodb.MongoException;
-import com.mongodb.client.MongoClient;
-import com.mongodb.client.MongoClients;
-import com.mongodb.client.MongoCollection;
-import com.mongodb.client.MongoDatabase;
-import com.mongodb.client.model.IndexOptions;
-import com.mongodb.client.model.Indexes;
-import com.mongodb.client.model.UpdateOptions;
-import com.mongodb.client.model.UpdateOneModel;
-import com.mongodb.client.model.BulkWriteOptions;
-import com.mongodb.client.model.WriteModel;
-import org.bson.Document;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Level;
+
+import static org.bson.codecs.configuration.CodecRegistries.fromProviders;
+import static org.bson.codecs.configuration.CodecRegistries.fromRegistries;
+import org.bson.codecs.configuration.CodecRegistry;
+import org.bson.codecs.pojo.PojoCodecProvider;
 import org.bukkit.Bukkit;
 import org.bukkit.OfflinePlayer;
 import org.bukkit.command.Command;
@@ -22,33 +29,30 @@ import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Set;
-import java.util.UUID;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.logging.Level;
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.BulkWriteOptions;
 import static com.mongodb.client.model.Filters.eq;
+import com.mongodb.client.model.IndexOptions;
+import com.mongodb.client.model.Indexes;
+import com.mongodb.client.model.UpdateOneModel;
+import com.mongodb.client.model.UpdateOptions;
 import static com.mongodb.client.model.Updates.combine;
 import static com.mongodb.client.model.Updates.currentDate;
 import static com.mongodb.client.model.Updates.inc;
 import static com.mongodb.client.model.Updates.set;
+import static com.mongodb.client.model.Updates.setOnInsert;
+import com.mongodb.client.model.WriteModel;
 
 /**
- * Shared whitelist sync. All Bukkit whitelist reads/writes are performed on the
- * main server thread. MongoDB operations run on a dedicated single worker
- * thread.
+ * Shared whitelist synchronization.
+ *
+ * Bukkit whitelist reads and writes happen on the main server thread. MongoDB
+ * operations run on a dedicated single worker thread.
  */
 public final class WhitelistSyncPlugin extends JavaPlugin {
 
@@ -57,16 +61,17 @@ public final class WhitelistSyncPlugin extends JavaPlugin {
 
     private volatile Set<UUID> lastAppliedSharedSnapshot;
     private volatile String lastError = "Not connected yet";
-    private volatile MongoCollection<Document> collection;
+    private volatile MongoCollection<WhitelistEntry> collection;
 
     private MongoClient mongoClient;
     private ExecutorService databaseExecutor;
     private BukkitTask pollTask;
+
     private String serverId;
     private int intervalSeconds;
     private boolean verbose;
     private String startupMode;
-    private boolean indexesReady;
+    private volatile boolean indexesReady;
     private int mongoBatchSize;
     private int applyBatchSize;
 
@@ -74,14 +79,22 @@ public final class WhitelistSyncPlugin extends JavaPlugin {
     public void onEnable() {
         saveDefaultConfig();
         loadSettings();
+
         databaseExecutor = Executors.newSingleThreadExecutor(runnable -> {
-            Thread thread = new Thread(runnable, "WhitelistSync-MongoDB");
+            Thread thread = new Thread(
+                    runnable,
+                    "WhitelistSync-MongoDB"
+            );
             thread.setDaemon(true);
             return thread;
         });
+
         createMongoClient();
         startPolling();
-        getLogger().info("WhitelistSync enabled; initial sync will run shortly.");
+
+        getLogger().info(
+                "WhitelistSync enabled; initial sync will run shortly."
+        );
     }
 
     @Override
@@ -89,20 +102,24 @@ public final class WhitelistSyncPlugin extends JavaPlugin {
         if (pollTask != null) {
             pollTask.cancel();
         }
+
         if (databaseExecutor != null) {
             databaseExecutor.shutdownNow();
         }
+
         if (mongoClient != null) {
             mongoClient.close();
         }
     }
 
     private String loadOrCreateServerId() {
-        String serverId = getConfig().getString("server-id", "").trim();
+        String configuredId = getConfig()
+                .getString("server-id", "")
+                .trim();
 
-        if (!serverId.isEmpty()) {
+        if (!configuredId.isEmpty()) {
             try {
-                return UUID.fromString(serverId).toString();
+                return UUID.fromString(configuredId).toString();
             } catch (IllegalArgumentException exception) {
                 getLogger().warning(
                         "Invalid server-id in config.yml; generating a new ID."
@@ -110,59 +127,145 @@ public final class WhitelistSyncPlugin extends JavaPlugin {
             }
         }
 
-        serverId = UUID.randomUUID().toString();
+        String generatedId = UUID.randomUUID().toString();
 
-        getConfig().set("server-id", serverId);
+        getConfig().set("server-id", generatedId);
         saveConfig();
 
-        getLogger().info("Generated and saved server ID: " + serverId);
+        getLogger().info("Generated and saved server ID: " + generatedId);
 
-        return serverId;
+        return generatedId;
     }
 
     private void loadSettings() {
         FileConfiguration config = getConfig();
+
         serverId = loadOrCreateServerId();
-        intervalSeconds = Math.max(2, config.getInt("sync-interval-seconds", 5));
+
+        intervalSeconds = Math.max(
+                2,
+                config.getInt("sync-interval-seconds", 5)
+        );
+
         verbose = config.getBoolean("verbose-logging", true);
-        startupMode = config.getString("startup-mode", "merge").trim().toLowerCase();
-        mongoBatchSize = Math.max(100, getConfig().getInt("mongo-batch-size", 1000));
-        applyBatchSize = Math.max(25, getConfig().getInt("apply-batch-size", 200));
+
+        startupMode = config.getString("startup-mode", "merge")
+                .trim()
+                .toLowerCase(Locale.ROOT);
+
+        mongoBatchSize = Math.max(
+                100,
+                config.getInt("mongo-batch-size", 1000)
+        );
+
+        applyBatchSize = Math.max(
+                25,
+                config.getInt("apply-batch-size", 200)
+        );
+
         if (!startupMode.equals("merge")) {
-            getLogger().warning("Unknown startup-mode '" + startupMode + "'; using merge.");
+            getLogger().warning(
+                    "Unknown startup-mode '" + startupMode
+                    + "'; using merge."
+            );
             startupMode = "merge";
         }
     }
 
     private void createMongoClient() {
+        MongoClient newClient = null;
+
         try {
-            String uri = getConfig().getString("mongodb.uri", "").trim();
+            String uri = getConfig()
+                    .getString("mongodb.uri", "")
+                    .trim();
+
             if (uri.isEmpty() || uri.contains("CHANGE_ME")) {
-                throw new IllegalArgumentException("Set mongodb.uri in plugins/WhitelistSync/config.yml first.");
+                throw new IllegalArgumentException(
+                        "Set mongodb.uri in plugins/WhitelistSync/config.yml first."
+                );
             }
-            if (mongoClient != null) {
-                mongoClient.close();
-            }
+
+            CodecRegistry pojoRegistry = fromRegistries(
+                    MongoClientSettings.getDefaultCodecRegistry(),
+                    fromProviders(
+                            PojoCodecProvider.builder()
+                                    .automatic(true)
+                                    .build()
+                    )
+            );
+
             MongoClientSettings settings = MongoClientSettings.builder()
                     .applyConnectionString(new ConnectionString(uri))
-                    .applyToSocketSettings(builder -> builder.connectTimeout(
-                            Math.max(1000, getConfig().getInt("mongodb.connect-timeout-ms", 5000)),
-                            TimeUnit.MILLISECONDS))
-                    .applyToClusterSettings(builder -> builder.serverSelectionTimeout(
-                            Math.max(1000, getConfig().getInt("mongodb.server-selection-timeout-ms", 5000)),
-                            TimeUnit.MILLISECONDS))
+                    .codecRegistry(pojoRegistry)
+                    .applyToSocketSettings(builder
+                            -> builder.connectTimeout(
+                                    Math.max(
+                                            1000,
+                                            getConfig().getInt(
+                                                    "mongodb.connect-timeout-ms",
+                                                    5000
+                                            )
+                                    ),
+                                    TimeUnit.MILLISECONDS
+                            )
+                    )
+                    .applyToClusterSettings(builder
+                            -> builder.serverSelectionTimeout(
+                                    Math.max(
+                                            1000,
+                                            getConfig().getInt(
+                                                    "mongodb.server-selection-timeout-ms",
+                                                    5000
+                                            )
+                                    ),
+                                    TimeUnit.MILLISECONDS
+                            )
+                    )
                     .build();
-            mongoClient = MongoClients.create(settings);
-            MongoDatabase database = mongoClient.getDatabase(
-                    getConfig().getString("mongodb.database", "minecraft"));
-            collection = database.getCollection(
-                    getConfig().getString("mongodb.collection", "shared_whitelist"));
+
+            newClient = MongoClients.create(settings);
+
+            MongoDatabase database = newClient.getDatabase(
+                    getConfig().getString(
+                            "mongodb.database",
+                            "minecraft"
+                    )
+            );
+
+            MongoCollection<WhitelistEntry> newCollection
+                    = database.getCollection(
+                            getConfig().getString(
+                                    "mongodb.collection",
+                                    "shared_whitelist"
+                            ),
+                            WhitelistEntry.class
+                    );
+
+            MongoClient oldClient = mongoClient;
+
+            mongoClient = newClient;
+            collection = newCollection;
             indexesReady = false;
             lastError = null;
+
+            if (oldClient != null) {
+                oldClient.close();
+            }
         } catch (Exception exception) {
+            if (newClient != null && newClient != mongoClient) {
+                newClient.close();
+            }
+
             collection = null;
             lastError = exception.getMessage();
-            getLogger().log(Level.SEVERE, "MongoDB configuration error: " + exception.getMessage());
+
+            getLogger().log(
+                    Level.SEVERE,
+                    "MongoDB configuration error: "
+                    + exception.getMessage(),
+                    exception
+            );
         }
     }
 
@@ -170,24 +273,39 @@ public final class WhitelistSyncPlugin extends JavaPlugin {
         if (pollTask != null) {
             pollTask.cancel();
         }
-        long periodTicks = Math.max(40L, intervalSeconds * 20L);
-        pollTask = Bukkit.getScheduler().runTaskTimer(this, this::beginSync, 40L, periodTicks);
+
+        long periodTicks = Math.max(
+                40L,
+                intervalSeconds * 20L
+        );
+
+        pollTask = Bukkit.getScheduler().runTaskTimer(
+                this,
+                this::beginSync,
+                40L,
+                periodTicks
+        );
     }
 
     private void beginSync() {
         if (!cycleRunning.compareAndSet(false, true)) {
             return;
         }
+
         if (collection == null) {
             createMongoClient();
+
             if (collection == null) {
                 cycleRunning.set(false);
                 return;
             }
         }
 
+        // Capture Bukkit state on the main server thread.
         Set<UUID> localSnapshot = currentWhitelist();
+
         Map<UUID, String> localUsernames = new HashMap<>();
+
         for (OfflinePlayer player : Bukkit.getWhitelistedPlayers()) {
             localUsernames.put(
                     player.getUniqueId(),
@@ -196,85 +314,132 @@ public final class WhitelistSyncPlugin extends JavaPlugin {
         }
 
         Set<UUID> baseline = lastAppliedSharedSnapshot == null
-                ? null : new HashSet<>(lastAppliedSharedSnapshot);
+                ? null
+                : new HashSet<>(lastAppliedSharedSnapshot);
 
-        databaseExecutor.execute(() -> {
-            try {
-                MongoCollection<Document> coll = collection;
-                if (coll == null) {
-                    throw new IllegalStateException("MongoDB collection is unavailable");
-                }
-                if (!indexesReady) {
-                    coll.createIndex(Indexes.ascending("uuid"),
-                            new IndexOptions().unique(true).name("unique_uuid"));
-                    coll.createIndex(Indexes.ascending("active"), new IndexOptions().name("active_lookup"));
-                    indexesReady = true;
-                }
-                coll.find().limit(1).first();
+        MongoCollection<WhitelistEntry> coll = collection;
 
-                if (baseline == null && startupMode.equals("merge")) {
-                    seedLocalWhitelist(coll, localSnapshot, localUsernames);
-                } else if (baseline != null) {
-                    Set<UUID> added = new HashSet<>(localSnapshot);
-                    added.removeAll(baseline);
+        try {
+            databaseExecutor.execute(() -> {
+                try {
+                    if (!indexesReady) {
+                        coll.createIndex(
+                                Indexes.ascending("uuid"),
+                                new IndexOptions()
+                                        .unique(true)
+                                        .name("unique_uuid")
+                        );
 
-                    Set<UUID> removed = new HashSet<>(baseline);
-                    removed.removeAll(localSnapshot);
+                        coll.createIndex(
+                                Indexes.ascending("active"),
+                                new IndexOptions()
+                                        .name("active_lookup")
+                        );
 
-                    for (UUID uuid : added) {
-                        publish(coll, uuid, true, "local-change");
+                        indexesReady = true;
                     }
 
-                    for (UUID uuid : removed) {
-                        publish(coll, uuid, false, "local-change");
-                    }
-                }
+                    // Check connectivity before reconciling.
+                    coll.find().limit(1).first();
 
-                Set<UUID> sharedActive = fetchActiveUuids(coll);
-                Bukkit.getScheduler().runTask(this, ()
-                        -> applySharedWhitelist(sharedActive, () -> {
-                            lastAppliedSharedSnapshot = new HashSet<>(sharedActive);
-                            lastSuccessfulSync.set(System.currentTimeMillis());
-                            lastError = null;
-                            cycleRunning.set(false);
-                        })
-                );
-            } catch (Exception exception) {
-                lastError = exception.getMessage();
-                getLogger().log(Level.WARNING,
-                        "MongoDB sync failed; local whitelist was not reconciled. Will retry. Cause: "
-                        + exception.getMessage());
-                cycleRunning.set(false);
-            }
-        });
+                    if (baseline == null && startupMode.equals("merge")) {
+                        seedLocalWhitelist(
+                                coll,
+                                localSnapshot,
+                                localUsernames
+                        );
+                    } else if (baseline != null) {
+                        Set<UUID> added = new HashSet<>(localSnapshot);
+                        added.removeAll(baseline);
+
+                        Set<UUID> removed = new HashSet<>(baseline);
+                        removed.removeAll(localSnapshot);
+
+                        for (UUID uuid : added) {
+                            publish(coll, uuid, true, "local-change");
+                        }
+
+                        for (UUID uuid : removed) {
+                            publish(coll, uuid, false, "local-change");
+                        }
+                    }
+
+                    Set<UUID> sharedActive = fetchActiveUuids(coll);
+
+                    Bukkit.getScheduler().runTask(this, ()
+                            -> applySharedWhitelist(
+                                    sharedActive,
+                                    () -> {
+                                        lastAppliedSharedSnapshot
+                                        = new HashSet<>(sharedActive);
+
+                                        lastSuccessfulSync.set(
+                                                System.currentTimeMillis()
+                                        );
+
+                                        lastError = null;
+                                        cycleRunning.set(false);
+                                    }
+                            )
+                    );
+                } catch (Exception exception) {
+                    lastError = exception.getMessage();
+
+                    getLogger().log(
+                            Level.WARNING,
+                            "MongoDB sync failed; local whitelist was "
+                            + "not reconciled. Will retry. Cause: "
+                            + exception.getMessage(),
+                            exception
+                    );
+
+                    cycleRunning.set(false);
+                }
+            });
+        } catch (RejectedExecutionException exception) {
+            lastError = "Database executor is shutting down";
+            cycleRunning.set(false);
+        }
     }
 
-    private void publish(MongoCollection<Document> coll, UUID uuid, boolean active, String source) {
-        coll.updateOne(eq("uuid", uuid.toString()), combine(
-                set("active", active),
-                set("changedBy", serverId),
-                set("changeSource", source),
-                currentDate("updatedAt"),
-                inc("revision", 1L)),
-                new UpdateOptions().upsert(true));
+    private void publish(
+            MongoCollection<WhitelistEntry> coll,
+            UUID uuid,
+            boolean active,
+            String source
+    ) {
+        coll.updateOne(
+                eq("uuid", uuid.toString()),
+                combine(
+                        set("active", active),
+                        set("changedBy", serverId),
+                        set("changeSource", source),
+                        currentDate("updatedAt"),
+                        inc("revision", 1L)
+                ),
+                new UpdateOptions().upsert(true)
+        );
+
         if (verbose) {
-            getLogger().info("Published " + (active ? "ADD " : "REMOVE ") + uuid + " to shared whitelist.");
+            getLogger().info(
+                    "Published " + (active ? "ADD " : "REMOVE ")
+                    + uuid + " to shared whitelist."
+            );
         }
     }
 
     private Set<UUID> fetchActiveUuids(
-            MongoCollection<Document> coll
+            MongoCollection<WhitelistEntry> coll
     ) {
         Set<UUID> active = new HashSet<>();
 
-        for (Document document : coll.find(eq("active", true))
+        for (WhitelistEntry entry : coll.find(eq("active", true))
                 .projection(
-                        com.mongodb.client.model.Projections
-                                .include("uuid")
+                        com.mongodb.client.model.Projections.include("uuid")
                 )
                 .batchSize(mongoBatchSize)) {
 
-            String value = document.getString("uuid");
+            String value = entry.getUuid();
 
             if (value == null) {
                 continue;
@@ -294,9 +459,11 @@ public final class WhitelistSyncPlugin extends JavaPlugin {
 
     private Set<UUID> currentWhitelist() {
         Set<UUID> result = new HashSet<>();
+
         for (OfflinePlayer player : Bukkit.getWhitelistedPlayers()) {
             result.add(player.getUniqueId());
         }
+
         return result;
     }
 
@@ -328,12 +495,12 @@ public final class WhitelistSyncPlugin extends JavaPlugin {
         operations.addAll(toAdd);
         operations.addAll(toRemove);
 
-        applyBatch(operations, 0, toAdd.size(), onSuccess);
-
         getLogger().info(
                 "Whitelist reconciliation queued: add="
                 + toAdd.size() + ", remove=" + toRemove.size()
         );
+
+        applyBatch(operations, 0, toAdd.size(), onSuccess);
     }
 
     private void applyBatch(
@@ -350,7 +517,6 @@ public final class WhitelistSyncPlugin extends JavaPlugin {
 
             for (int i = offset; i < end; i++) {
                 UUID uuid = operations.get(i);
-
                 boolean shouldWhitelist = i < addCount;
 
                 Bukkit.getOfflinePlayer(uuid)
@@ -382,34 +548,44 @@ public final class WhitelistSyncPlugin extends JavaPlugin {
         }
     }
 
+    /**
+     * Seeds records using typed POJO update operations.
+     *
+     * setOnInsert only populates missing records. Existing shared records are
+     * not overwritten during startup merge.
+     */
     private void seedLocalWhitelist(
-            MongoCollection<Document> coll,
+            MongoCollection<WhitelistEntry> coll,
             Set<UUID> localSnapshot,
             Map<UUID, String> usernames
     ) {
-        List<WriteModel<Document>> batch
+        List<WriteModel<WhitelistEntry>> batch
                 = new ArrayList<>(mongoBatchSize);
 
         for (UUID uuid : localSnapshot) {
-            Document seed = new Document("uuid", uuid.toString())
-                    .append("active", true)
-                    .append("username", usernames.getOrDefault(uuid, ""))
-                    .append("changedBy", serverId)
-                    .append("changeSource", "startup-merge")
-                    .append("updatedAt", new java.util.Date())
-                    .append("revision", 1L);
+            String uuidString = uuid.toString();
 
             batch.add(new UpdateOneModel<>(
-                    eq("uuid", uuid.toString()),
-                    new Document("$setOnInsert", seed),
+                    eq("uuid", uuidString),
+                    combine(
+                            setOnInsert("uuid", uuidString),
+                            setOnInsert("active", true),
+                            setOnInsert(
+                                    "username",
+                                    usernames.getOrDefault(uuid, "")
+                            ),
+                            setOnInsert("changedBy", serverId),
+                            setOnInsert("changeSource", "startup-merge"),
+                            setOnInsert("updatedAt", new Date()),
+                            setOnInsert("revision", 1L)
+                    ),
                     new UpdateOptions().upsert(true)
             ));
 
             if (batch.size() >= mongoBatchSize) {
                 coll.bulkWrite(
                         batch,
-                        new com.mongodb.client.model.BulkWriteOptions()
-                                .ordered(false)
+                        new BulkWriteOptions().ordered(false)
                 );
                 batch.clear();
             }
@@ -418,46 +594,69 @@ public final class WhitelistSyncPlugin extends JavaPlugin {
         if (!batch.isEmpty()) {
             coll.bulkWrite(
                     batch,
-                    new com.mongodb.client.model.BulkWriteOptions()
-                            .ordered(false)
+                    new BulkWriteOptions().ordered(false)
             );
         }
 
         getLogger().info(
-                "Seeded local whitelist candidates: " + localSnapshot.size()
+                "Seeded local whitelist candidates: "
+                + localSnapshot.size()
         );
     }
 
     public String statusText() {
         long last = lastSuccessfulSync.get();
-        String age = last == 0L ? "never" : ((System.currentTimeMillis() - last) / 1000L) + "s ago";
-        return "last-success=" + age + ", interval=" + intervalSeconds + "s, "
-                + (lastError == null ? "database=ok" : "database/error=" + lastError);
+
+        String age = last == 0L
+                ? "never"
+                : ((System.currentTimeMillis() - last) / 1000L)
+                + "s ago";
+
+        return "last-success=" + age
+                + ", interval=" + intervalSeconds + "s, "
+                + (lastError == null
+                        ? "database=ok"
+                        : "database/error=" + lastError);
     }
 
     @Override
-    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+    public boolean onCommand(
+            CommandSender sender,
+            Command command,
+            String label,
+            String[] args
+    ) {
         if (!command.getName().equalsIgnoreCase("whitelistsync")) {
             return false;
         }
 
         if (!sender.hasPermission("whitelistsync.admin")) {
-            sender.sendMessage("You do not have permission to use this command.");
+            sender.sendMessage(
+                    "You do not have permission to use this command."
+            );
             return true;
         }
 
-        String subcommand = args.length == 0 ? "status" : args[0].toLowerCase();
+        String subcommand = args.length == 0
+                ? "status"
+                : args[0].toLowerCase(Locale.ROOT);
 
         switch (subcommand) {
-            case "status" -> {
-                sender.sendMessage("WhitelistSync: " + statusText());
-            }
+            case "status" ->
+                sender.sendMessage(
+                        "WhitelistSync: " + statusText()
+                );
 
             case "sync" -> {
                 if (cycleRunning.get()) {
-                    sender.sendMessage("WhitelistSync: sync already running.");
+                    sender.sendMessage(
+                            "WhitelistSync: sync already running."
+                    );
                 } else {
-                    Bukkit.getScheduler().runTask(this, this::beginSync);
+                    Bukkit.getScheduler().runTask(
+                            this,
+                            this::beginSync
+                    );
                     sender.sendMessage("WhitelistSync: sync queued.");
                 }
             }
@@ -465,7 +664,8 @@ public final class WhitelistSyncPlugin extends JavaPlugin {
             case "reload" -> {
                 if (cycleRunning.get()) {
                     sender.sendMessage(
-                            "WhitelistSync: wait for the current sync to finish before reloading."
+                            "WhitelistSync: wait for the current sync "
+                            + "to finish before reloading."
                     );
                     return true;
                 }
@@ -476,7 +676,8 @@ public final class WhitelistSyncPlugin extends JavaPlugin {
                 startPolling();
 
                 sender.sendMessage(
-                        "WhitelistSync: configuration reloaded; database configuration valid: "
+                        "WhitelistSync: configuration reloaded; "
+                        + "database configuration valid: "
                         + (collection != null)
                 );
             }
