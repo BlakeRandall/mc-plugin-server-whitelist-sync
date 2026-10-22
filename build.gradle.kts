@@ -4,7 +4,9 @@ plugins {
 }
 
 group = "dev.example.whitelistsync"
-version = "1.0.0"
+version = providers.gradleProperty("releaseVersion")
+    .orElse("1.0.0-SNAPSHOT")
+    .get()
 
 repositories {
     mavenCentral()
@@ -30,6 +32,13 @@ tasks.withType<JavaCompile>().configureEach {
 
 tasks.test {
     useJUnitPlatform()
+}
+
+tasks.processResources {
+    inputs.property("version", project.version)
+    filesMatching("plugin.yml") {
+        expand("version" to project.version)
+    }
 }
 
 tasks.jar {

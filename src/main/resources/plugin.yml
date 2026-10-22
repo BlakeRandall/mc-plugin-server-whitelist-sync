@@ -1,5 +1,5 @@
 name: WhitelistSync
-version: 1.0.0
+version: "${version}"
 main: dev.example.whitelistsync.WhitelistSyncPlugin
 api-version: '26.1'
 description: Synchronizes Paper whitelists through a shared MongoDB database.
